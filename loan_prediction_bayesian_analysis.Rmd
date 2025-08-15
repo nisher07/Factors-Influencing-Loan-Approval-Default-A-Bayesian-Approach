@@ -1,0 +1,466 @@
+---
+title: "Factors Influencing Loan Approval & Default - A Bayesian Approach"
+output: 
+  pdf_document: default
+  html_document:
+    df_print: paged
+date: "2024-12-31"
+---
+
+## Introduction
+
+This notebook demonstrates the use of a Bayesian approach to predict loan approval based on various factors.
+
+### Load Required Libraries
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(modelr)
+library(tidybayes)
+library(dplyr)
+library(bayesplot)
+library(posterior)
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+library(brms)
+library(ROCR)
+```
+
+### Data Loading
+
+```{r}
+df <- read.csv('loan_approval_dataset.csv')
+head(df)
+```
+
+### Data Preprocessing
+
+```{r}
+# Cleaning and Transforming Data
+preprocess_data <- function(df) {
+
+  df$loan_id <- NULL # Remove unnecessary loan_id column
+
+  # Rename columns for clarity
+  colnames(df)[which(names(df) == "income_annum")] <- "annual_income"
+  colnames(df)[which(names(df) == "cibil_score")] <- "credit_score"
+
+  cat("\n--- Dataset Info ---\n")
+  str(df)
+  
+  cat("\n--- Missing Values ---\n")
+  missing_values <- colSums(is.na(df))
+  print(missing_values[missing_values > 0])
+
+  cat("\n--- Duplicate Rows ---\n")
+  duplicate_rows <- sum(duplicated(df))
+  cat("Number of duplicate rows:", duplicate_rows, "\n")
+
+  cat("\n--- Unique Values in Categorical Columns ---\n")
+  categorical_columns <- names(df)[sapply(df, is.factor) | sapply(df, is.character)]
+  for (col in categorical_columns) {
+    unique_vals <- unique(df[[col]])
+    cat(col, ":", length(unique_vals), "unique values\n", unique_vals, "\n")
+  }
+
+  return(df)
+}
+df <- preprocess_data(df)
+```
+
+### Summary Statistics
+
+```{r}
+summary(df)
+```
+
+### Data Encoding
+
+```{r}
+df$education <- trimws(df$education)
+df$self_employed <- trimws(df$self_employed)
+df$loan_status <- trimws(df$loan_status)
+
+# Convert categorical variables to binary format
+df$education <- ifelse(df$education == "Graduate", 1, 0)
+df$self_employed <- ifelse(df$self_employed == "Yes", 1, 0)
+df$loan_status <- ifelse(df$loan_status == "Approved", 1, 0)
+
+head(df)
+```
+
+### Feature Scaling and Transformation
+
+```{r}
+# Min-Max Scaling Function
+min_max_scaler <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+df$no_of_dependents <- min_max_scaler(df$no_of_dependents)
+df$loan_term <- min_max_scaler(df$loan_term)
+
+# Standardization
+df$annual_income <- scale(df$annual_income)
+df$credit_score <- scale(df$credit_score)
+
+# Log Transformation for skewed columns
+log_columns <- c('loan_amount', 'residential_assets_value', 'commercial_assets_value',
+                 'luxury_assets_value', 'bank_asset_value')
+
+for (col in log_columns) {
+  df[[col]] <- ifelse(df[[col]] >= 0, log(df[[col]] + 1), NA) 
+}
+
+# Handle NaN or Inf values
+nan_inf_check <- sapply(df, function(x) sum(is.na(x) | is.infinite(x)))
+
+if (any(nan_inf_check > 0)) {
+  print("Columns with NaN or Inf values:")
+  print(nan_inf_check[nan_inf_check > 0])
+} else {
+  print("No NaN or Inf values found in the DataFrame.")
+}
+
+# Impute missing values with median
+for (col in log_columns) {
+  median_value <- median(df[[col]], na.rm = TRUE)
+  df[[col]] <- ifelse(is.na(df[[col]]) | is.infinite(df[[col]]), median_value, df[[col]])
+}
+
+nan_inf_check_after <- sapply(df, function(x) sum(is.na(x) | is.infinite(x)))
+
+if (any(nan_inf_check_after > 0)) {
+  print("Columns with remaining NaN or Inf values:")
+  print(nan_inf_check_after[nan_inf_check_after > 0])
+} else {
+  print("No NaN or Inf values found after handling.")
+}
+
+head(df)
+```
+
+### Distribution of Numerical Features
+
+```{r}
+features <- c('annual_income', 'loan_amount', 'loan_term',
+              'credit_score', 'residential_assets_value', 
+              'commercial_assets_value', 'luxury_assets_value', 
+              'bank_asset_value')
+
+plots <- list()
+for (feature in features) {
+  data_to_plot <- df[[feature]]
+  p <- ggplot(data = data.frame(value = data_to_plot), aes(x = value)) +
+    geom_histogram(aes(y = ..density..), 
+                   fill = "blue", 
+                   color = "black", 
+                   bins = 20, 
+                   alpha = 0.5) +
+    geom_density(color = "red", size = 0.5) +
+    labs(title = paste(feature), 
+         x = feature, 
+         y = "Density") +
+    theme_minimal()+
+    theme(
+      plot.title = element_text(size = 8, face = "bold"),
+      axis.title = element_text(size = 6),
+      axis.text = element_text(size = 8)
+    )
+  plots[[feature]] <- p
+}
+plot_grid <- wrap_plots(plots, ncol = 3) + 
+  plot_layout(guides = 'collect') & theme(plot.margin = margin(5, 5, 5, 5))
+print(plot_grid)
+```
+
+### Bayesian Logistic Regression Model
+
+#### Model 1
+
+Fitting Model 1 using weakly informative normal prior using all the features initially
+
+```{r}
+features1 <- c('annual_income', 'loan_amount', 'no_of_dependents', 'loan_term',
+              'credit_score', 'residential_assets_value', 'commercial_assets_value',
+              'luxury_assets_value', 'bank_asset_value', 'education', 'self_employed')
+target <- 'loan_status'
+
+formula1 <- as.formula(paste(target, "~", paste(features1, collapse = " + ")))
+
+prior1 <- set_prior("normal(0, 2)", class = "b") + 
+         set_prior("normal(0, 2)", class = "Intercept") 
+
+model1 <- brm(formula1, data = df, family = bernoulli(link = "logit"), prior = prior1, seed = 1234)
+```
+
+#### Model1 Diagnostics & Evaluation
+
+```{r}
+mcmc_trace(model1)
+```
+
+```{r}
+summary(model1)
+```
+
+#### Fixed Effects Visualization
+
+```{r}
+fixef_df <- as.data.frame(fixef(model1, summary = TRUE))
+ggplot(fixef_df, aes(x = Estimate, y = rownames(fixef_df))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = `Q2.5`, xmax = `Q97.5`)) +
+  theme_minimal() +
+  labs(x = "Estimate", y = "Parameter", title = "Fixed Effects")
+```
+
+#### Model1 Performance Evaluation
+
+```{r}
+m1_pred_prob <- apply(posterior_predict(model1), 2, mean)
+m1_pred_class <- ifelse(m1_pred_prob > 0.5, 1, 0)
+
+actual_class <- df[[target]]
+
+m1_conf_matrix <- table(Predicted = m1_pred_class, Actual = actual_class)
+
+m1_accuracy <- sum(diag(m1_conf_matrix)) / sum(m1_conf_matrix)
+m1_precision <- m1_conf_matrix[2, 2] / (m1_conf_matrix[2, 2] + m1_conf_matrix[1, 2])
+m1_recall <- m1_conf_matrix[2, 2] / (m1_conf_matrix[2, 2] + m1_conf_matrix[2, 1])
+m1_f1_score <- 2 * (m1_precision * m1_recall) / (m1_precision + m1_recall)
+
+cat("Accuracy:", round(m1_accuracy, 2), "\n")
+cat("Precision:", round(m1_precision, 2), "\n")
+cat("Recall:", round(m1_recall, 2), "\n")
+cat("F1 Score:", round(m1_f1_score, 2), "\n")
+```
+
+```{r}
+m1_conf_matrix_df <- as.data.frame(m1_conf_matrix)
+
+ggplot(m1_conf_matrix_df, aes(x = Predicted, y = Actual, fill = Freq)) +
+  geom_tile(color = "white") +  
+  geom_text(aes(label = Freq), vjust = 1) +  
+  scale_fill_gradient(low = "white", high = "steelblue") +  
+  labs(title = "Confusion Matrix", x = "Predicted Class", y = "Actual Class") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+m1_pred <- prediction(m1_pred_prob, actual_class)
+m1_perf <- performance(m1_pred, measure = "tpr", x.measure = "fpr")
+
+m1_auc_perf <- performance(m1_pred, measure = "auc")
+m1_auc_score <- as.numeric(m1_auc_perf@y.values)
+
+plot(
+  m1_perf,
+  col = "blue",
+  lwd = 2,
+  main = sprintf("ROC Curve (AUC = %.2f)", m1_auc_score)
+)
+
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+# cat(sprintf("AUC Score: %.2f\n", m1_auc_score))
+```
+
+#### Model1 Prior vs. Posterior Distribution Comparison
+
+```{r}
+set.seed(1234)
+sample_size <- 1000
+
+m1_prior_samples <- lapply(features1, function(feature) {
+  rnorm(sample_size, mean = 0, sd = 1) 
+})
+names(m1_prior_samples) <- features1
+
+m1_posterior_samples <- as_draws_df(model1)
+
+m1_plot_data <- bind_rows(
+  lapply(features1, function(feature) {
+    
+    m1_prior_data <- data.frame(
+      Value = m1_prior_samples[[feature]],
+      Source = "Prior",
+      Feature = feature
+    )
+   
+    m1_posterior_data <- data.frame(
+      Value = m1_posterior_samples[[paste0("b_", feature)]],
+      Source = "Posterior",
+      Feature = feature
+    )
+    bind_rows(m1_prior_data, m1_posterior_data)
+  })
+)
+
+m1_plot_list <- lapply(unique(m1_plot_data$Feature), function(feature) {
+  ggplot(data = filter(m1_plot_data, Feature == feature), aes(x = Value, fill = Source)) +
+    geom_density(alpha = 0.5) +
+    labs(
+      title = feature,
+      x = "Value",
+      y = "Density",
+      fill = "Source"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 8, face = "bold"),
+      axis.title = element_text(size = 6),
+      axis.text = element_text(size = 8)
+    )
+})
+
+m1_plot_grid <- wrap_plots(m1_plot_list, ncol = 4) + 
+  plot_layout(guides = 'collect') & theme(plot.margin = margin(5, 5, 5, 5)) 
+
+options(repr.plot.width = 15, repr.plot.height = 10)
+
+print(m1_plot_grid)
+```
+
+#### Model 2
+
+Fitting Model 2 using selected features
+
+```{r}
+features2 <- c('annual_income', 'loan_amount', 'loan_term',
+              'credit_score', 'luxury_assets_value')
+target <- 'loan_status'
+
+formula2 <- as.formula(paste(target, "~", paste(features2, collapse = " + ")))
+
+prior2 <- set_prior("normal(0, 2)", class = "b") + 
+         set_prior("normal(0, 2)", class = "Intercept") 
+
+model2 <- brm(formula2, data = df, family = bernoulli(link = "logit"), prior = prior2, seed = 1234)
+```
+
+#### Model2 Diagnostics & Evaluation
+
+```{r}
+mcmc_trace(model2)
+```
+
+```{r}
+summary(model2)
+```
+
+### Clustering Analysis for Annual Income and Credit Score
+
+```{r}
+set.seed(42)
+# K-Means Clustering
+kmeans_annual_income <- kmeans(df$annual_income, centers = 3, nstart = 25)
+kmeans_credit_score <- kmeans(df$credit_score, centers = 3, nstart = 25)
+
+df$annual_income_cluster <- kmeans_annual_income$cluster
+df$credit_score_cluster <- kmeans_credit_score$cluster
+
+# Assign cluster labels
+df$annual_income_cluster_label <- ifelse(df$annual_income_cluster == 1, 'Low Income', 
+                                  ifelse(df$annual_income_cluster == 2, 'Medium Income', 'High Income'))
+
+df$credit_score_cluster_label <- ifelse(df$credit_score_cluster == 1, 'Low Risk', 
+                                ifelse(df$credit_score_cluster == 2, 'Medium Risk', 'High Risk'))
+```
+
+```{r}
+table(df$annual_income_cluster)
+table(df$credit_score_cluster)
+```
+
+```{r}
+df$annual_income_cluster <- as.factor(df$annual_income_cluster)
+df$credit_score_cluster <- as.factor(df$credit_score_cluster)
+```
+
+```{r}
+head(df)
+```
+
+### Incorporating Hierarchical Structure
+
+Model 3 and 4 introduces a hierarchical structure by treating credit_score_cluster and annual_income_cluster as a group-level (random) effect.
+
+#### Model 3 - Credit Score Clusters
+
+```{r}
+features3 <- c('annual_income', 'loan_amount', 'loan_term',
+              'luxury_assets_value')
+
+formula3 <- as.formula(paste(target, "~", paste(features3, collapse = " + "), 
+                            "+ (1 | credit_score_cluster) "))
+
+prior3 <- set_prior("normal(0, 2)", class = "b") + 
+         set_prior("normal(0, 2)", class = "Intercept") +
+        set_prior("normal(0, 2)", class = "sd", group = "credit_score_cluster")
+
+
+model3 <- brm(formula3, data = df, family = bernoulli(link = "logit"), prior = prior3, seed = 1234,  control = list(adapt_delta = 0.995,max_treedepth = 15))
+```
+
+```{r}
+mcmc_trace(model3)
+```
+
+```{r}
+summary(model3)
+```
+
+#### Model 4 - Annual Income Clusters
+
+```{r}
+features4 <- c('credit_score', 'loan_amount', 'loan_term',
+              'luxury_assets_value')
+
+formula4 <- as.formula(paste(target, "~", paste(features4, collapse = " + "), 
+                            "+ (1 | annual_income_cluster) "))
+
+prior4 <- set_prior("normal(0, 2)", class = "b") + 
+         set_prior("normal(0, 2)", class = "Intercept") +
+        set_prior("normal(0, 2)", class = "sd", group = "annual_income_cluster")
+
+
+model4 <- brm(formula4, data = df, family = bernoulli(link = "logit"), prior = prior4, seed = 1234,  control = list(adapt_delta = 0.995,max_treedepth = 15))
+```
+
+```{r}
+mcmc_trace(model4)
+```
+
+```{r}
+summary(model4)
+```
+
+### Model Comparison Using Leave-One-Out Cross Validation
+
+```{r}
+m1_loo <- loo(model1, save_psis = TRUE, cores = 4)
+print(m1_loo)
+```
+
+```{r}
+m2_loo <- loo(model2, save_psis = TRUE, cores = 4)
+print(m2_loo)
+```
+
+```{r}
+m3_loo <- loo(model3, save_psis = TRUE, cores = 4)
+print(m3_loo)
+```
+
+```{r}
+m4_loo <- loo(model4, save_psis = TRUE, cores = 4)
+print(m4_loo)
+```
+
+```{r}
+loo_compare(m1_loo, m2_loo,m3_loo, m4_loo)
+```
+
+Based on the LOO comparison, we can conclude model2 has the best predictive performance and is the most appropriate for the data at hand.

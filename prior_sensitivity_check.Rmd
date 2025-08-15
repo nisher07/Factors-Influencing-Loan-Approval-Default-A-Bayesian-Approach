@@ -1,0 +1,120 @@
+---
+title: "Prior Sensitivity Check"
+output: 
+  pdf_document: default
+  html_document:
+    df_print: paged
+date: "2024-12-31"
+---
+
+## Introduction
+In this notebook we compared four models with different priors and evaluate their predictive performance using Leave-One-Out Cross-Validation (LOO).
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(modelr)
+library(tidybayes)
+library(dplyr)
+library(bayesplot)
+library(posterior)
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+library(brms)
+library(ROCR)
+```
+
+
+### Preprocessed Data
+```{r}
+df <- read.csv('preprocessed_loan_data.csv')
+head(df)
+```
+
+
+### Model 1: Weakly Informative Normal Prior
+
+```{r}
+features <- c('annual_income', 'loan_amount', 'no_of_dependents', 'loan_term',
+              'credit_score', 'residential_assets_value', 'commercial_assets_value',
+              'luxury_assets_value', 'bank_asset_value', 'education', 'self_employed')
+target <- 'loan_status'
+
+formula1 <- as.formula(paste(target, "~", paste(features, collapse = " + ")))
+
+prior1 <- set_prior("normal(0, 2)", class = "b") + 
+         set_prior("normal(0, 2)", class = "Intercept") 
+
+fit1 <- brm(formula1, data = df, family = bernoulli(link = "logit"), prior = prior1, seed = 1234)
+```
+
+
+### Model 2: Stronger Normal Prior
+
+```{r}
+formula2 <- as.formula(paste(target, "~", paste(features, collapse = " + ")))
+
+prior2 <- set_prior("normal(0, 1)", class = "b") + 
+         set_prior("normal(0, 1)", class = "Intercept") 
+
+fit2 <- brm(formula2, data = df, family = bernoulli(link = "logit"), prior = prior2, seed = 1234)
+```
+
+### Model 3: Student-t Prior
+
+```{r}
+formula3 <- as.formula(paste(target, "~", paste(features, collapse = " + ")))
+
+prior3 <- set_prior("student_t(3, 0, 1)", class = "b") + 
+          set_prior("student_t(3, 0, 1)", class = "Intercept") 
+
+fit3 <- brm(formula3, data = df, family = bernoulli(link = "logit"), prior = prior3, seed = 1234)
+```
+
+
+### Model 4: Weakly Regularizing Normal Prior
+
+```{r}
+formula4 <- as.formula(paste(target, "~", paste(features, collapse = " + ")))
+
+prior4 <- set_prior("normal(0, 10)", class = "b") + 
+         set_prior("normal(0, 10)", class = "Intercept") 
+
+fit4 <- brm(formula4, data = df, family = bernoulli(link = "logit"), prior = prior4, seed = 1234)
+```
+
+### Posterior Distribution Visualization
+
+```{r}
+posterior1 <- posterior_samples(fit1)
+posterior2 <- posterior_samples(fit2)
+posterior3 <- posterior_samples(fit3)
+posterior4 <- posterior_samples(fit4)
+
+coef_name <- "b_annual_income"
+posterior_plot <- data.frame(
+  value = c(posterior1[[coef_name]], posterior2[[coef_name]], posterior3[[coef_name]], posterior4[[coef_name]]),
+  model = rep(c("prior1", "prior2", "prior3", "prior4"), each = nrow(posterior1))
+)
+
+ggplot(posterior_plot, aes(x = value, fill = model)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Posterior Distributions of Annual Income Coefficient", x = "Value", y = "Density")
+```
+
+
+### Model Comparison Using LOO-CV
+
+```{r}
+loo_fit1 <- loo(fit1)
+loo_fit2 <- loo(fit2)
+loo_fit3 <- loo(fit3)
+loo_fit4 <- loo(fit4)
+```
+
+
+```{r}
+loo_compare(loo_fit1, loo_fit2, loo_fit3, loo_fit4)
+```
+The results suggest that the data is not highly sensitive to the choice of prior, as all models exhibit similar performance.
+
